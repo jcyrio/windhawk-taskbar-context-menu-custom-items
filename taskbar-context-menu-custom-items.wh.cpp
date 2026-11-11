@@ -451,9 +451,73 @@ std::wstring GlyphFromIconSetting(const std::wstring& icon, bool* isCodePoint) {
     return glyph;
 }
 
+// An element the mod added to a taskbar menu. The click handler is the only
+// object in a menu that is implemented by the mod, so it has to be removed
+// before the mod is unloaded. The elements are tracked with weak references so
+// that tracking doesn't keep closed menus alive.
+struct InjectedElement {
+    winrt::weak_ref<wuxc::MenuFlyoutItemBase> element;
+    winrt::event_token clickToken{};
+    bool hasClickHandler = false;
+};
+
+std::mutex g_injectedElementsMutex;
+std::vector<InjectedElement> g_injectedElements;
+
+void TrackInjectedElement(InjectedElement&& element) {
+    std::lock_guard<std::mutex> lock(g_injectedElementsMutex);
+    g_injectedElements.push_back(std::move(element));
+}
+
+// Forgets the elements of menus that no longer exist.
+void PruneInjectedElements() {
+    std::lock_guard<std::mutex> lock(g_injectedElementsMutex);
+    std::erase_if(g_injectedElements, [](const InjectedElement& entry) {
+        return !entry.element.get();
+    });
+}
+
+// Detaches the mod from the menus it added elements to: removes the click
+// handlers and hides the elements, in case a menu is open or is shown again.
+// Must be called from the taskbar thread.
+void ReleaseInjectedElements() {
+    std::vector<InjectedElement> elements;
+    {
+        std::lock_guard<std::mutex> lock(g_injectedElementsMutex);
+        elements.swap(g_injectedElements);
+    }
+
+    int released = 0;
+    for (const auto& entry : elements) {
+        try {
+            auto element = entry.element.get();
+            if (!element) {
+                continue;
+            }
+
+            if (entry.hasClickHandler) {
+                if (auto item = element.try_as<wuxc::MenuFlyoutItem>()) {
+                    item.Click(entry.clickToken);
+                }
+            }
+
+            element.Visibility(wux::Visibility::Collapsed);
+            released++;
+        } catch (...) {
+        }
+    }
+
+    Wh_Log(L"Released %d menu element(s)", released);
+}
+
 wuxc::MenuFlyoutSeparator CreateSeparator() {
     wuxc::MenuFlyoutSeparator separator;
     separator.Name(kInjectedElementName);
+
+    InjectedElement tracked;
+    tracked.element = winrt::make_weak<wuxc::MenuFlyoutItemBase>(separator);
+    TrackInjectedElement(std::move(tracked));
+
     return separator;
 }
 
@@ -482,16 +546,25 @@ wuxc::MenuFlyoutItemBase CreateMenuItem(const MenuItemSettings& settings) {
         item.Icon(icon);
     }
 
+    // The weak reference is created before the click handler is added, so that
+    // a handler is never added to an element that can't be tracked.
+    InjectedElement tracked;
+    tracked.element = winrt::make_weak<wuxc::MenuFlyoutItemBase>(item);
+
     if (settings.command.empty()) {
         // A label without a command acts as a heading.
         item.IsEnabled(false);
     } else {
-        item.Click([settings](wf::IInspectable const&,
-                              wux::RoutedEventArgs const&) {
-            Wh_Log(L"Clicked \"%s\"", settings.name.c_str());
-            Launch(settings);
-        });
+        tracked.clickToken =
+            item.Click([settings](wf::IInspectable const&,
+                                  wux::RoutedEventArgs const&) {
+                Wh_Log(L"Clicked \"%s\"", settings.name.c_str());
+                Launch(settings);
+            });
+        tracked.hasClickHandler = true;
     }
+
+    TrackInjectedElement(std::move(tracked));
 
     return item;
 }
@@ -510,6 +583,10 @@ std::vector<wuxc::MenuFlyoutItemBase> CreateCustomElements(
         wuxc::MenuFlyoutSubItem subItem;
         subItem.Name(kInjectedElementName);
         subItem.Text(settings.submenuName);
+
+        InjectedElement tracked;
+        tracked.element = winrt::make_weak<wuxc::MenuFlyoutItemBase>(subItem);
+        TrackInjectedElement(std::move(tracked));
 
         auto subItems = subItem.Items();
         for (const auto& item : settings.items) {
@@ -551,6 +628,8 @@ void* GetIdentity(MenuItemsVector const& items) {
 // was added to it.
 void InjectCustomElements(MenuItemsVector const& items, MenuBuildState& state) {
     const Settings& settings = *state.settings;
+
+    PruneInjectedElements();
 
     auto elements = CreateCustomElements(settings);
     if (elements.empty()) {
@@ -670,7 +749,7 @@ void __cdecl ContextMenus_ShowTaskbarSettingsContextMenu_Hook(
         ~ScopedMenuBuild() { g_menuBuildState = nullptr; }
     };
 
-    if (state.settings && !state.settings->items.empty()) {
+    if (state.settings && !state.settings->items.empty() && !g_unloading) {
         ScopedMenuBuild scopedMenuBuild(&state);
 
         ContextMenus_ShowTaskbarSettingsContextMenu_Original(
@@ -748,6 +827,84 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     return module;
 }
 
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND taskbarWnd = nullptr;
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            DWORD processId = 0;
+            WCHAR className[32];
+            if (GetWindowThreadProcessId(hWnd, &processId) &&
+                processId == GetCurrentProcessId() &&
+                GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hWnd;
+                return FALSE;
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&taskbarWnd));
+
+    return taskbarWnd;
+}
+
+using RunFromWindowThreadProc_t = void (*)(void* parameter);
+
+// Runs a function on the thread of the given window and waits for it to
+// complete.
+bool RunFromWindowThread(HWND hWnd,
+                         RunFromWindowThreadProc_t proc,
+                         void* procParam) {
+    static const UINT runFromWindowThreadRegisteredMsg =
+        RegisterWindowMessageW(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct RUN_FROM_WINDOW_THREAD_PARAM {
+        RunFromWindowThreadProc_t proc;
+        void* procParam;
+    };
+
+    DWORD threadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (threadId == 0) {
+        return false;
+    }
+
+    if (threadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookExW(
+        WH_CALLWNDPROC,
+        [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (nCode == HC_ACTION) {
+                const CWPSTRUCT* cwp = reinterpret_cast<const CWPSTRUCT*>(lParam);
+                if (cwp->message == runFromWindowThreadRegisteredMsg) {
+                    auto* param =
+                        reinterpret_cast<RUN_FROM_WINDOW_THREAD_PARAM*>(
+                            cwp->lParam);
+                    param->proc(param->procParam);
+                }
+            }
+
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        },
+        nullptr, threadId);
+    if (!hook) {
+        return false;
+    }
+
+    RUN_FROM_WINDOW_THREAD_PARAM param;
+    param.proc = proc;
+    param.procParam = procParam;
+    SendMessageW(hWnd, runFromWindowThreadRegisteredMsg, 0,
+                 reinterpret_cast<LPARAM>(&param));
+
+    UnhookWindowsHookEx(hook);
+
+    return true;
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
@@ -805,8 +962,33 @@ void Wh_ModSettingsChanged() {
     LoadSettings();
 }
 
-void Wh_ModUninit() {
+// Called before the hooks are removed. From here on, no elements are added to
+// new menus.
+void Wh_ModBeforeUninit() {
     Wh_Log(L">");
 
     g_unloading = true;
+}
+
+// Called after the hooks are removed.
+void Wh_ModUninit() {
+    Wh_Log(L">");
+
+    bool hasInjectedElements;
+    {
+        std::lock_guard<std::mutex> lock(g_injectedElementsMutex);
+        hasInjectedElements = !g_injectedElements.empty();
+    }
+
+    // The menu elements belong to the taskbar thread and can only be accessed
+    // from it.
+    if (hasInjectedElements) {
+        HWND taskbarWnd = FindCurrentProcessTaskbarWnd();
+        if (!taskbarWnd ||
+            !RunFromWindowThread(
+                taskbarWnd, [](void*) { ReleaseInjectedElements(); },
+                nullptr)) {
+            Wh_Log(L"Failed to release the menu elements");
+        }
+    }
 }
