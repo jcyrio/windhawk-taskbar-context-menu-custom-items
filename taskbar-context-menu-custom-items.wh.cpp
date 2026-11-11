@@ -19,6 +19,8 @@ The Windows 11 taskbar right-click menu only offers "Taskbar settings" and
 "Task Manager". This mod lets you add your own items to that menu. Each item
 has a label, an optional icon, and a command that runs when you click it.
 
+![The taskbar menu with three custom items](https://raw.githubusercontent.com/jcyrio/windhawk-taskbar-context-menu-custom-items/main/screenshot.png)
+
 The items are added to the native menu itself, so they look and behave like
 the built-in ones.
 
