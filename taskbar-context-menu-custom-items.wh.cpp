@@ -880,7 +880,8 @@ bool RunFromWindowThread(HWND hWnd,
         WH_CALLWNDPROC,
         [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
             if (nCode == HC_ACTION) {
-                const CWPSTRUCT* cwp = reinterpret_cast<const CWPSTRUCT*>(lParam);
+                const CWPSTRUCT* cwp =
+                    reinterpret_cast<const CWPSTRUCT*>(lParam);
                 if (cwp->message == runFromWindowThreadRegisteredMsg) {
                     auto* param =
                         reinterpret_cast<RUN_FROM_WINDOW_THREAD_PARAM*>(
