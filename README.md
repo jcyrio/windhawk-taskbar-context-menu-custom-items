@@ -5,7 +5,7 @@ to the taskbar right-click menu. Out of the box that menu only offers "Taskbar
 settings" and "Task Manager". With this mod it can also start programs, open
 folders, run scripts, and jump to URLs or settings pages.
 
-![The taskbar menu with three custom items](screenshot.png)
+![The taskbar menu with custom items](screenshot.png)
 
 The items are added to the native menu itself, so they look and behave like the
 built-in ones.
@@ -30,8 +30,8 @@ Each item in the mod settings has:
 | Field | Meaning |
 | --- | --- |
 | Label | Text shown in the menu. A single dash (`-`) adds a separator line. |
-| Command | Anything the Run dialog (Win+R) accepts: a program, a file or script, a folder, a URL, an `ms-settings:` page or a `shell:` location. Environment variables are expanded. |
-| Arguments | Optional command-line arguments. |
+| Command | What to open: a program, a file or script, a folder, a URL, an `ms-settings:` page or a `shell:` location. Environment variables are expanded. |
+| Arguments | Optional command-line arguments. They go here and not in the Command field, so `notepad.exe C:\notes.txt` is split over the two fields. |
 | Icon | Optional hex code of a [Segoe Fluent Icons](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font) glyph such as `E756`, or a single character such as an emoji. |
 | Run as administrator | Starts the command elevated, with the usual UAC prompt. |
 | Hide window | Starts the command without a visible window. Useful for scripts and console commands. |
@@ -49,6 +49,9 @@ heading.
 | Network connections | `ncpa.cpl` | |
 | My script | `powershell.exe` | `-NoProfile -File "C:\Scripts\my script.ps1"` |
 | Restart Explorer | `cmd.exe` | `/c taskkill /f /im explorer.exe & start explorer.exe` |
+
+The Restart Explorer example closes all File Explorer windows and stops file
+copies that are in progress. Turn on "Hide window" for it.
 
 ## Other settings
 
